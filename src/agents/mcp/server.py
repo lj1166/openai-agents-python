@@ -2391,7 +2391,7 @@ class MCPServerStreamableHttp(_MCPServerWithClientSession):
 
         self.params = params
         self._name = name or f"streamable_http: {self.params['url']}"
-        self._serialize_session_requests = True
+        self._serialize_session_requests = not MCP_V2
 
     def create_streams(
         self,

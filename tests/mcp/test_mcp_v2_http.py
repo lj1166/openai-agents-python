@@ -286,6 +286,99 @@ async def test_v2_streamable_http_retries_connect_error_on_isolated_session():
     assert all(client.is_closed for client in clients)
 
 
+@pytest.mark.asyncio
+async def test_v2_streamable_http_allows_concurrent_tool_requests():
+    tool_calls_started = 0
+    both_tool_calls_started = asyncio.Event()
+    release_tool_calls = asyncio.Event()
+
+    def factory(headers=None, timeout=None, auth=None):
+        async def handler(request):
+            nonlocal tool_calls_started
+            payload = json.loads(request.content) if request.content else {}
+            if payload.get("method") == "tools/call":
+                tool_calls_started += 1
+                if tool_calls_started == 2:
+                    both_tool_calls_started.set()
+                await release_tool_calls.wait()
+            return _v2_response_for_request(request)
+
+        return httpx2.AsyncClient(
+            transport=httpx2.MockTransport(handler),
+            headers=headers,
+            timeout=timeout,
+            auth=auth,
+        )
+
+    server = MCPServerStreamableHttp(
+        params={
+            "url": "https://example.test/mcp",
+            "httpx_client_factory": factory,
+        },
+    )
+
+    async with server:
+        tool_calls = asyncio.gather(
+            server.call_tool("first", {}),
+            server.call_tool("second", {}),
+        )
+        try:
+            await asyncio.wait_for(both_tool_calls_started.wait(), timeout=2)
+        finally:
+            release_tool_calls.set()
+        results = await tool_calls
+
+    assert tool_calls_started == 2
+    assert all(isinstance(result.content[0], TextContent) for result in results)
+
+
+@pytest.mark.asyncio
+async def test_v2_streamable_http_cancelling_one_overlapping_request_keeps_sibling():
+    cancelled_request_started = asyncio.Event()
+    sibling_request_started = asyncio.Event()
+
+    def factory(headers=None, timeout=None, auth=None):
+        async def handler(request):
+            payload = json.loads(request.content) if request.content else {}
+            if payload.get("method") == "tools/call":
+                tool_name = payload["params"]["name"]
+                if tool_name == "cancelled":
+                    cancelled_request_started.set()
+                    await asyncio.Event().wait()
+                elif tool_name == "sibling":
+                    await cancelled_request_started.wait()
+                    sibling_request_started.set()
+            return _v2_response_for_request(request)
+
+        return httpx2.AsyncClient(
+            transport=httpx2.MockTransport(handler),
+            headers=headers,
+            timeout=timeout,
+            auth=auth,
+        )
+
+    server = MCPServerStreamableHttp(
+        params={
+            "url": "https://example.test/mcp",
+            "httpx_client_factory": factory,
+        },
+    )
+
+    async with server:
+        cancelled_task = asyncio.create_task(server.call_tool("cancelled", {}))
+        await asyncio.wait_for(cancelled_request_started.wait(), timeout=2)
+        sibling_task = asyncio.create_task(server.call_tool("sibling", {}))
+        await asyncio.wait_for(sibling_request_started.wait(), timeout=2)
+
+        cancelled_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled_task
+        sibling_result = await asyncio.wait_for(sibling_task, timeout=2)
+
+    assert isinstance(sibling_result.content[0], TextContent)
+    assert sibling_result.content[0].text == "ok"
+
+
 def _first_tool_call_returns_503_factory(clients: list[Any], tool_call_statuses: list[int]):
     """Build clients whose server answers only the first `tools/call` with HTTP 503."""
 

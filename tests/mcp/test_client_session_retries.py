@@ -699,7 +699,10 @@ async def test_serialized_prompt_requests_prevent_tool_cancellation(prompt_metho
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("prompt_method", ["list_prompts", "get_prompt"])
-async def test_streamable_http_serializes_call_tool_with_prompt_requests(prompt_method: str):
+async def test_v1_streamable_http_serializes_call_tool_with_prompt_requests(
+    monkeypatch, prompt_method: str
+):
+    monkeypatch.setattr("agents.mcp.server.MCP_V2", False)
     shared_session = OverlapTrackingSession()
     isolated_session = IsolatedRetrySession()
     server = DummyPromptStreamableHttpServer(shared_session, isolated_session)
@@ -720,6 +723,21 @@ async def test_streamable_http_serializes_call_tool_with_prompt_requests(prompt_
         assert isinstance(results[1], GetPromptResult)
     assert shared_session.max_in_flight == 1
     assert isolated_session.call_tool_attempts == 0
+
+
+@pytest.mark.asyncio
+async def test_v2_streamable_http_allows_overlapping_shared_session_requests(monkeypatch):
+    monkeypatch.setattr("agents.mcp.server.MCP_V2", True)
+    shared_session = OverlapTrackingSession()
+    server = DummyStreamableHttpServer(shared_session, IsolatedRetrySession())
+
+    results = await asyncio.gather(
+        server.call_tool("first", None),
+        server.call_tool("second", None),
+    )
+
+    assert all(isinstance(result, CallToolResult) for result in results)
+    assert shared_session.max_in_flight == 2
 
 
 class FlakyRuntimeErrorSession:
